@@ -1,0 +1,15 @@
+{
+  // Cloudflare のダッシュボードで作る Worker の名前と、ここの name を同じにすること
+  "name": "oboro-server",
+  "main": "index.js",
+  "compatibility_date": "2025-10-01",
+  // ルームごとの Durable Object(無料プランでは SQLite 型が必要)
+  "durable_objects": {
+    "bindings": [{ "name": "ROOMS", "class_name": "Room" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Room"] }],
+  "vars": {
+    // ゲームを置いたサイトだけに使わせる場合に設定する(例 "https://ユーザー名.github.io")。空なら制限なし
+    "ALLOWED_ORIGINS": ""
+  }
+}
