@@ -3,13 +3,21 @@
   "name": "oboro-server",
   "main": "index.js",
   "compatibility_date": "2025-10-01",
-  // ルームごとの Durable Object(無料プランでは SQLite 型が必要)
+  // ルームごとの Durable Object と、ランダム対戦の待合所(1つだけ)。無料プランでは SQLite 型が必要
   "durable_objects": {
-    "bindings": [{ "name": "ROOMS", "class_name": "Room" }]
+    "bindings": [
+      { "name": "ROOMS", "class_name": "Room" },
+      { "name": "LOBBY", "class_name": "Lobby" }
+    ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Room"] }],
+  // migrations は消さずに足していく(v1 を消すと、既存のルームが使えなくなる)
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Room"] },
+    { "tag": "v2", "new_sqlite_classes": ["Lobby"] }
+  ],
   "vars": {
-    // ゲームを置いたサイトだけに使わせる場合に設定する(例 "https://ユーザー名.github.io")。空なら制限なし
-    "ALLOWED_ORIGINS": ""
+    // ゲームを置いたサイトだけに使わせる(カンマ区切りで複数可)。空 "" にすると制限なし
+    // GitHub Pages はリポジトリ名に関係なく、Origin は https://ユーザー名.github.io になる
+    "ALLOWED_ORIGINS": "https://jh0ndo3.github.io"
   }
 }

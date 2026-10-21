@@ -4,6 +4,8 @@
 //   各プレイヤーには「公開情報+自分の駒の正体」だけを送り、相手の伏せ駒の正体は送らない。
 // ・指し手は、サーバーが本当の駒でルールどおりか検査してから反映する。
 // ・プレイヤーの端末どうしは直接つながらないので、相手にIPアドレスは見えない。
+// ・ランダム対戦(レートあり)は、Durable Object「Lobby」(1つだけ)が待ち行列とレートを持つ。
+//   組み合わせが決まると、Lobby がルームを作り(Room の /init)、終局したら Room が結果を Lobby に知らせる(/result)。
 import { DurableObject } from "cloudflare:workers";
 
 /* =========================================================
@@ -185,6 +187,18 @@ const PALETTE_N = 6;
 const clampCol = v => (isInt(v, 0, PALETTE_N - 1) ? v : 0);
 const sqOk = a => Array.isArray(a) && a.length === 2 && isInt(a[0], 0, N - 1) && isInt(a[1], 0, N - 1);
 const rid = () => crypto.randomUUID().replace(/-/g, '').slice(0, 12);
+const hex = n => { const a = new Uint8Array(n); crypto.getRandomValues(a); return [...a].map(b => b.toString(16).padStart(2, '0')).join(''); };
+const rint = n => { const a = new Uint32Array(1); crypto.getRandomValues(a); return a[0] % n; };
+const CODE_CH = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';   // 見間違えやすい I・O・0・1 は使わない(index.html と同じ)
+const genCode = () => Array.from({length: 4}, () => CODE_CH[rint(CODE_CH.length)]).join('');
+async function sha256(t) { const b = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(t)); return [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join(''); }
+const json = (o, status = 200) => new Response(JSON.stringify(o), {status, headers: {'content-type': 'application/json'}});
+// 配置の時間切れ用:自陣2段にランダムに置く
+function randomLayout(side) {
+  const sq = []; for (let q = 0; q < N * N; q++) if (inSetupZone(side, Math.floor(q / N))) sq.push(q);
+  for (let i = sq.length - 1; i > 0; i--) { const j = rint(i + 1); [sq[i], sq[j]] = [sq[j], sq[i]]; }
+  const o = {}; TYPES.forEach((t, i) => { o[t] = sq[i]; }); return o;
+}
 function cleanLayout(lay, side) {
   if (!lay || typeof lay !== 'object') return null;
   const o = {};
@@ -197,6 +211,9 @@ function cleanLayout(lay, side) {
    ========================================================= */
 const MAX_MEMBERS = 12, MAX_SPEC = 8;
 const IDLE_MS = 7 * 24 * 3600 * 1000;   // 7日間 使われなかったルームは消す
+// レート戦の持ち時間(切れたら負け。配置だけは時間切れでランダム配置にして対局を始める)
+const SETUP_MS = 120 * 1000, MOVE_MS = 90 * 1000;
+const REPORT_RETRY_MS = 15000, REPORT_TRIES = 20;
 
 export class Room extends DurableObject {
   constructor(ctx, env) {
@@ -208,8 +225,10 @@ export class Room extends DurableObject {
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', 'pong'));
   }
   async fetch(req) {
-    if (req.headers.get('Upgrade') !== 'websocket') return new Response('WebSocket で接続してください', {status: 426});
     const url = new URL(req.url);
+    // Lobby からだけ届く(入口の Worker は /ws しかルームに渡さないので、外からは呼べない)
+    if (url.pathname === '/init' && req.method === 'POST') return this.initRated(await req.json().catch(() => null));
+    if (req.headers.get('Upgrade') !== 'websocket') return new Response('WebSocket で接続してください', {status: 426});
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     this.ctx.acceptWebSocket(server);
@@ -225,7 +244,54 @@ export class Room extends DurableObject {
   async save() {
     this.room.at = Date.now();
     await this.ctx.storage.put('room', this.room);
-    if (!(await this.ctx.storage.getAlarm())) await this.ctx.storage.setAlarm(Date.now() + IDLE_MS);
+    await this.ctx.storage.setAlarm(this.nextAlarm());
+  }
+  // 次に起きる時刻:持ち時間の期限、結果の送り直し、どちらもなければ削除の確認
+  nextAlarm() {
+    const R = this.room, t = [Date.now() + IDLE_MS];
+    if (R && R.deadline) t.push(R.deadline);
+    if (R && R.rated && !R.rated.done && R.phase === 'over') t.push(R.rated.retry || Date.now() + 1000);
+    return Math.min(...t);
+  }
+  // ---- レート戦 ----
+  async initRated(d) {   // Lobby が組み合わせたルームを作る。席・名前・合言葉は Lobby が決めたもの
+    const ok = d && /^[A-Z0-9]{4}$/.test(d.code) && typeof d.mid === 'string' && Array.isArray(d.players) && d.players.length === 2
+      && d.players.every(p => p && /^[0-9a-f]{32}$/.test(p.tok) && Number.isFinite(p.r));
+    if (!ok) return new Response('bad', {status: 400});
+    if (this.room) return new Response('exists', {status: 409});   // このIDは使用中(Lobby が別のIDで作り直す)
+    const [a, b] = d.players.map(p => ({tok: p.tok, name: cleanName(p.name), col: clampCol(p.col), r: Math.round(p.r)}));
+    if (a.col === b.col) b.col = (b.col + 1) % PALETTE_N;
+    this.room = {code: d.code, phase: 'setup', gen: 1, spec: true, seats: [a.tok, b.tok],
+      members: [a, b].map(x => ({tok: x.tok, name: x.name, col: x.col})), layouts: [null, null], game: null, at: Date.now(),
+      rated: {mid: d.mid, r: [a.r, b.r], nr: null, d: null, done: false, tries: 0, retry: 0}, auto: [false, false], deadline: Date.now() + SETUP_MS};
+    await this.save();
+    return new Response('ok');
+  }
+  timeUp() {   // 持ち時間が切れた
+    const R = this.room;
+    if (R.phase === 'setup') {   // 配置していない側はランダムに置いて、対局を始める
+      for (const s of [0, 1]) if (!R.layouts[s]) { R.layouts[s] = randomLayout(s); R.auto[s] = true; }
+      R.game = newGame(R.layouts); R.phase = 'play'; R.deadline = Date.now() + MOVE_MS;
+    } else if (R.phase === 'play' && R.game && !R.game.over) {
+      const g = R.game, s = g.turn;
+      g.over = true; g.winner = 1 - s; g.reason = `${SIDE_NAME[s]}の時間切れ`; g.note = '';
+      R.phase = 'over';
+    } else R.deadline = 0;
+  }
+  async settle() {   // 終局したら持ち時間を止め、レート戦なら結果を Lobby に知らせる
+    const R = this.room;
+    if (!R || R.phase !== 'over') return;
+    R.deadline = 0;
+    const rt = R.rated;
+    if (!rt || rt.done || (rt.retry && Date.now() < rt.retry)) return;
+    let st = 0, j = null;
+    try {
+      const res = await this.env.LOBBY.get(this.env.LOBBY.idFromName('main')).fetch('https://lobby/result', {method: 'POST', body: JSON.stringify({mid: rt.mid, winner: R.game.winner})});
+      st = res.status; if (res.ok) j = await res.json();
+    } catch (e) { st = 0; }
+    if (j && Array.isArray(j.r) && Array.isArray(j.d)) { rt.nr = j.r.map(Number); rt.d = j.d.map(Number); rt.done = true; rt.retry = 0; }
+    else if (st === 404 || st === 400 || ++rt.tries >= REPORT_TRIES) { rt.done = true; rt.retry = 0; }   // 送り直しても無駄なので、あきらめる
+    else rt.retry = Date.now() + REPORT_RETRY_MS;
   }
   // 受け取り手ごとの部屋の状態(合言葉 tok は外に出さない)
   view(a, except) {
@@ -242,7 +308,10 @@ export class Room extends DurableObject {
       ready: [!!R.layouts[0], !!R.layouts[1]],
       game: g ? publicView(g) : null,
       mine: g && !g.over && seat >= 0 ? mineFor(g, seat) : null,
-      final: g && g.over ? {layouts: R.layouts, moves: g.moves} : null
+      final: g && g.over ? {layouts: R.layouts, moves: g.moves} : null,
+      rated: R.rated ? {r: R.rated.r, nr: R.rated.nr, d: R.rated.d, done: !!R.rated.done} : null,
+      auto: R.auto || [false, false],
+      deadline: R.deadline || 0, now: Date.now()
     };
   }
   push(except, only) {   // 全員(または1人)に、部屋の状態を送る
@@ -283,6 +352,7 @@ export class Room extends DurableObject {
       case 'again': {
         if (seat < 0 || !(R.seats[0] && R.seats[1])) return;
         if (m.t === 'start' ? R.phase !== 'lobby' : R.phase !== 'over') return;
+        if (R.rated) return;   // レート戦は1局だけ(もう一局はランダム対戦から)
         if (m.t === 'again') R.seats = [R.seats[1], R.seats[0]];   // もう一局は、先手と後手を入れ替える
         const x = R.members.find(y => y.tok === R.seats[0]), y = R.members.find(z => z.tok === R.seats[1]);
         if (x && y && x.col === y.col) y.col = (y.col + 1) % PALETTE_N;   // 色が同じなら後手側をずらす
@@ -294,7 +364,7 @@ export class Room extends DurableObject {
         const lay = cleanLayout(m.layout, seat);
         if (!lay) { this.send(ws, {t: 'err', e: 'badsetup'}); return; }
         R.layouts[seat] = lay;
-        if (R.layouts[0] && R.layouts[1]) { R.game = newGame(R.layouts); R.phase = 'play'; }
+        if (R.layouts[0] && R.layouts[1]) { R.game = newGame(R.layouts); R.phase = 'play'; if (R.rated) R.deadline = Date.now() + MOVE_MS; }
         break;
       }
       case 'move':
@@ -307,6 +377,7 @@ export class Room extends DurableObject {
         const bad = mv ? applyMove(g, mv) : 'shape';
         if (bad) { this.send(ws, {t: 'err', e: 'badmove'}); this.push(null, ws); return; }   // 正本で上書きしてもらう
         if (g.over) R.phase = 'over';
+        else if (R.rated) R.deadline = Date.now() + MOVE_MS;   // 手番が替わったので、持ち時間を新しく数える
         break;
       }
       case 'resign': {
@@ -323,6 +394,7 @@ export class Room extends DurableObject {
         return;
       default: return;
     }
+    await this.settle();
     await this.save();
     this.push();
   }
@@ -368,10 +440,175 @@ export class Room extends DurableObject {
   }
   async webSocketClose(ws, code) { try { ws.close(1000, 'bye'); } catch (e) {} await this.dropped(ws); }
   async webSocketError(ws) { await this.dropped(ws); }
-  async alarm() {   // 長く使われていないルームを消す
+  async alarm() {   // 持ち時間の期限・結果の送り直し・長く使われていないルームの削除
     if (!this.room) return;
-    if (Date.now() - (this.room.at || 0) > IDLE_MS && this.sockets().length === 0) { await this.ctx.storage.deleteAll(); this.room = null; }
-    else await this.ctx.storage.setAlarm(Date.now() + IDLE_MS);
+    const R = this.room, now = Date.now();
+    let changed = false;
+    if (R.rated && R.deadline && now >= R.deadline - 300) { this.timeUp(); changed = true; }
+    if (R.rated && R.phase === 'over' && !R.rated.done) { await this.settle(); changed = true; }
+    if (changed) { await this.save(); this.push(); return; }
+    if (now - (R.at || 0) > IDLE_MS && this.sockets().length === 0) { await this.ctx.storage.deleteAll(); this.room = null; }
+    else await this.ctx.storage.setAlarm(this.nextAlarm());
+  }
+}
+
+/* =========================================================
+   3b. ランダム対戦の待合所とレート(Durable Object「Lobby」。名前 'main' の1つだけを使う)
+   ・端末は /mm に WebSocket でつなぎ、hi(プレイヤーID と鍵)→ q(待ち行列に入る)を送る。
+   ・プレイヤーID(pid)は端末が作る。鍵(key)はハッシュだけを保存し、他人がそのIDのレートを使えないようにする。
+   ・レートの近い人から組む。待つほど許す差を広げ、30秒ほどで誰とでも組む。
+   ・組み合わせが決まったら、ルームを作り(Room の /init)、2人に match(ルームIDと合言葉)を送る。
+   ・終局すると Room から /result が届き、イロレーティングで更新する(同じ対局は1回だけ数える)。
+   ========================================================= */
+const RATE0 = 1500;
+const WIN0 = 150, WIN_STEP = 60, WIN_STEP_MS = 5000;   // 許すレート差:最初150、5秒ごとに+60
+const MM_TICK_MS = 3000;
+const PM_MS = 2 * 3600 * 1000;          // 組み合わせ済みの対局に戻れる時間(終局したら消す)
+const MATCH_KEEP_MS = 3 * 24 * 3600 * 1000;
+const kFactor = n => (n < 30 ? 32 : 16);   // 対局数が少ないうちは大きく動かす
+
+export class Lobby extends DurableObject {
+  constructor(ctx, env) {
+    super(ctx, env);
+    this.rate = new WeakMap();
+    this.pairing = false; this.pairAgain = false;
+    ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', 'pong'));
+  }
+  async fetch(req) {
+    const url = new URL(req.url);
+    // Room からだけ届く(入口の Worker は /mm しか Lobby に渡さないので、外からは呼べない)
+    if (url.pathname === '/result' && req.method === 'POST') return this.result(await req.json().catch(() => null));
+    if (req.headers.get('Upgrade') !== 'websocket') return new Response('WebSocket で接続してください', {status: 426});
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    this.ctx.acceptWebSocket(server);
+    server.serializeAttachment({ok: false});
+    return new Response(null, {status: 101, webSocket: client});
+  }
+  send(ws, m) { try { ws.send(JSON.stringify(m)); } catch (e) {} }
+  att(ws) { try { return ws.deserializeAttachment() || {}; } catch (e) { return {}; } }
+  live() { return this.ctx.getWebSockets().filter(s => s.readyState === undefined || s.readyState === 1); }
+  async webSocketMessage(ws, raw) {
+    if (typeof raw !== 'string' || raw.length > 1000) { try { ws.close(1009, 'too big'); } catch (e) {} return; }
+    const now = Date.now(), r = this.rate.get(ws) || {win: 0, cnt: 0};
+    if (now - r.win > 1000) { r.win = now; r.cnt = 0; }
+    this.rate.set(ws, r);
+    if (++r.cnt > 10) { if (r.cnt > 30) { try { ws.close(1008, 'too many'); } catch (e) {} } return; }
+    let m; try { m = JSON.parse(raw); } catch (e) { return; }
+    if (!m || typeof m !== 'object') return;
+    const a = this.att(ws);
+    if (m.t === 'hi') {
+      const pid = typeof m.pid === 'string' && /^[0-9a-f]{24}$/.test(m.pid) ? m.pid : '';
+      const key = typeof m.key === 'string' && /^[0-9a-f]{32}$/.test(m.key) ? m.key : '';
+      if (!pid || !key) { this.send(ws, {t: 'err', e: 'badplayer'}); return; }
+      const kh = await sha256(key);
+      let p = await this.ctx.storage.get('p:' + pid);
+      if (p && p.kh !== kh) { this.send(ws, {t: 'err', e: 'badkey'}); return; }
+      if (!p) p = {kh, r: RATE0, n: 0, w: 0, l: 0};
+      p.name = cleanName(m.name); p.at = now;
+      await this.ctx.storage.put('p:' + pid, p);
+      ws.serializeAttachment({ok: true, pid, name: p.name, col: clampCol(m.col), r: p.r, q: 0});
+      this.send(ws, {t: 'me', r: p.r, n: p.n, w: p.w, l: p.l});
+      return;
+    }
+    if (!a.ok) return;
+    if (m.t === 'q') {
+      let pm = await this.ctx.storage.get('pm:' + a.pid);   // 組み合わせ済みで、まだ終わっていない対局があれば、そこへ戻す
+      if (pm && Array.isArray(m.done) && m.done.slice(0, 20).includes(pm.mid)) { await this.ctx.storage.delete('pm:' + a.pid); pm = null; }   // 端末側では終局済み(戻っても時間切れで負けるだけなので、本人の申告で外してよい)
+      if (pm && now - pm.at < PM_MS) { this.send(ws, {t: 'match', ...pm, back: true}); return; }
+      for (const w of this.live()) { if (w === ws) continue; const b = this.att(w); if (b.ok && b.pid === a.pid && b.q) { b.q = 0; w.serializeAttachment(b); this.send(w, {t: 'err', e: 'replaced'}); try { w.close(4001, 'replaced'); } catch (e) {} } }
+      if (!a.q) { a.q = now; ws.serializeAttachment(a); }
+      this.send(ws, {t: 'queued'});
+      await this.pair();
+      return;
+    }
+    if (m.t === 'cancel') { a.q = 0; ws.serializeAttachment(a); this.send(ws, {t: 'cancelled'}); return; }
+  }
+  async webSocketClose(ws) { try { ws.close(1000, 'bye'); } catch (e) {} }
+  async webSocketError() {}
+  // 待ち行列から2人ずつ組む(同時に2回走らないようにする)
+  async pair() {
+    if (this.pairing) { this.pairAgain = true; return; }
+    this.pairing = true;
+    try {
+      do {
+        this.pairAgain = false;
+        const now = Date.now();
+        const qs = this.live().map(w => ({w, a: this.att(w)})).filter(x => x.a.ok && x.a.q).sort((x, y) => x.a.q - y.a.q);
+        const used = new Set(), jobs = [];
+        const win = x => WIN0 + WIN_STEP * Math.floor((now - x.a.q) / WIN_STEP_MS);
+        for (let i = 0; i < qs.length; i++) {
+          if (used.has(i)) continue;
+          let best = -1, bd = Infinity;
+          for (let j = i + 1; j < qs.length; j++) {
+            if (used.has(j) || qs[j].a.pid === qs[i].a.pid) continue;
+            const diff = Math.abs(qs[i].a.r - qs[j].a.r);
+            if (diff <= Math.max(win(qs[i]), win(qs[j])) && diff < bd) { best = j; bd = diff; }
+          }
+          if (best >= 0) {
+            used.add(i); used.add(best);
+            for (const x of [qs[i], qs[best]]) { x.a.q = 0; x.w.serializeAttachment(x.a); }   // 先に行列から外す
+            jobs.push([qs[i], qs[best]]);
+          }
+        }
+        for (const [x, y] of jobs) await this.makeMatch(x, y);
+        if (this.live().some(w => { const b = this.att(w); return b.ok && b.q; })) await this.ctx.storage.setAlarm(Date.now() + MM_TICK_MS);
+      } while (this.pairAgain);
+    } finally { this.pairing = false; }
+  }
+  async makeMatch(x, y) {
+    const now = Date.now(), mid = hex(12);
+    const seats = rint(2) ? [x, y] : [y, x];   // 先手後手はランダム
+    const players = seats.map(s => ({tok: hex(16), name: s.a.name, col: s.a.col, pid: s.a.pid, r: s.a.r}));
+    await this.ctx.storage.put('m:' + mid, {pids: players.map(p => p.pid), at: now, done: false});
+    let code = '';
+    for (let i = 0; i < 8 && !code; i++) {
+      const c = genCode();
+      try {
+        const res = await this.env.ROOMS.get(this.env.ROOMS.idFromName(c)).fetch('https://room/init', {method: 'POST',
+          body: JSON.stringify({code: c, mid, players: players.map(p => ({tok: p.tok, name: p.name, col: p.col, r: p.r}))})});
+        if (res.ok) code = c;
+      } catch (e) {}
+    }
+    if (!code) {   // ルームを作れなかった:2人を行列に戻す
+      await this.ctx.storage.delete('m:' + mid);
+      for (const s of seats) { const b = this.att(s.w); if (b.ok) { b.q = now; s.w.serializeAttachment(b); this.send(s.w, {t: 'queued'}); } }
+      return;
+    }
+    for (const k of [0, 1]) {
+      const o = players[1 - k];
+      const pm = {room: code, tok: players[k].tok, seat: k, mid, opp: {n: o.name, r: o.r}, me: {r: players[k].r}, at: now};
+      await this.ctx.storage.put('pm:' + players[k].pid, pm);
+      this.send(seats[k].w, {t: 'match', ...pm});
+    }
+  }
+  // 終局の結果(Room から)。イロレーティングで更新し、新しいレートと増減を返す
+  async result(d) {
+    if (!d || typeof d.mid !== 'string' || !/^[0-9a-f]{24}$/.test(d.mid)) return json({e: 'bad'}, 400);
+    const m = await this.ctx.storage.get('m:' + d.mid);
+    if (!m) return json({e: 'nomatch'}, 404);
+    if (m.done) return json({r: m.nr, d: m.d});   // 送り直し:同じ答えを返す(二重に数えない)
+    if (!(d.winner === 0 || d.winner === 1)) return json({e: 'bad'}, 400);
+    const ps = await Promise.all(m.pids.map(async id => (await this.ctx.storage.get('p:' + id)) || {kh: '', r: RATE0, n: 0, w: 0, l: 0}));
+    const [a, b] = ps, ea = 1 / (1 + 10 ** ((b.r - a.r) / 400)), sa = d.winner === 0 ? 1 : 0;
+    const da = Math.round(kFactor(a.n) * (sa - ea)), db = Math.round(kFactor(b.n) * ((1 - sa) - (1 - ea)));
+    a.r += da; b.r += db; a.n++; b.n++;
+    if (sa) { a.w++; b.l++; } else { a.l++; b.w++; }
+    Object.assign(m, {done: true, d: [da, db], nr: [a.r, b.r], winner: d.winner, end: Date.now()});
+    await this.ctx.storage.put({['p:' + m.pids[0]]: a, ['p:' + m.pids[1]]: b, ['m:' + d.mid]: m});
+    await this.ctx.storage.delete(m.pids.map(id => 'pm:' + id));
+    return json({r: m.nr, d: m.d});
+  }
+  async alarm() {   // 待っている人がいれば組み直す。ときどき古い記録を片付ける
+    await this.pair();
+    const now = Date.now(), last = (await this.ctx.storage.get('prunedAt')) || 0;
+    if (now - last > 3600 * 1000) {
+      const del = [];
+      for (const [k, v] of await this.ctx.storage.list({prefix: 'm:'})) if (now - (v.at || 0) > MATCH_KEEP_MS) del.push(k);
+      for (const [k, v] of await this.ctx.storage.list({prefix: 'pm:'})) if (now - (v.at || 0) > PM_MS) del.push(k);
+      for (let i = 0; i < del.length; i += 128) await this.ctx.storage.delete(del.slice(i, i + 128));
+      await this.ctx.storage.put('prunedAt', now);
+    }
   }
 }
 
@@ -389,6 +626,10 @@ export default {
       const code = url.searchParams.get('room') || '';
       if (!/^[A-Z0-9]{4}$/.test(code)) return new Response('ルームIDが正しくありません', {status: 400});
       return env.ROOMS.get(env.ROOMS.idFromName(code)).fetch(req);
+    }
+    if (url.pathname === '/mm') {   // ランダム対戦の待合所
+      if (req.headers.get('Upgrade') !== 'websocket') return new Response('WebSocket で接続してください', {status: 426});
+      return env.LOBBY.get(env.LOBBY.idFromName('main')).fetch(req);
     }
     if (url.pathname === '/') return new Response('おぼろ将棋 中継サーバー:動作中', {headers: {'content-type': 'text/plain; charset=utf-8'}});
     return new Response('見つかりません', {status: 404});
